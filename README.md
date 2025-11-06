@@ -17,17 +17,8 @@ Shama Copilot provides real-time insights and recommendations for your AKS clust
 
 ## 📁 Project Structure
 
-shama-aks-copilot/
-├── kubernetes/ # Kubernetes manifests
-│ ├── shama-copilot-deployment.yaml # Main deployment
-│ ├── shama-copilot-config.yaml # Configuration
-│ ├── shama-copilot-rbac.yaml # Security permissions
-│ ├── myapp-deployment.yaml # Test application
-│ └── archive/ # Development versions
-├── scripts/
-│ └── deploy.sh # Deployment script
-└── docs/
-└── implementation-guide.md
+![Uploading image.png…]()
+
 
 ##  Quick Start
 
