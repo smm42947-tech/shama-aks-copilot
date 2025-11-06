@@ -1,4 +1,4 @@
-<img width="395" height="243" alt="image" src="https://github.com/user-attachments/assets/3fb94f49-792e-4f7a-998d-c98ae90d2ee1" /># Shama AKS Copilot
+## Aks-copilot
 
 A Kubernetes-based AI assistant for monitoring and managing Azure Kubernetes Service (AKS) clusters, implemented during hands-on lab sessions.
 
@@ -21,7 +21,6 @@ Shama Copilot provides real-time insights and recommendations for your AKS clust
 ## 📁 Project Structure
 
 <img width="395" height="243" alt="image" src="https://github.com/user-attachments/assets/807af4a4-9d2b-440a-949f-46bc32016bc9" />
-
 
 
 ##  Quick Start
