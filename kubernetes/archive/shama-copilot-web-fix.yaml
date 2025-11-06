@@ -1,0 +1,412 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shama-copilot-deployment
+  namespace: shama-copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shama-copilot
+  template:
+    metadata:
+      labels:
+        app: shama-copilot
+    spec:
+      serviceAccountName: shama-copilot-sa
+      containers:
+      - name: copilot
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8000
+        env:
+        - name: AZURE_OPENAI_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: endpoint
+        - name: AZURE_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: api-key
+        - name: DEPLOYMENT_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: deployment-name
+        - name: API_VERSION
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: api-version
+        - name: API_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: api-timeout
+        - name: MAX_TOKENS
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: max-tokens
+        - name: TEMPERATURE
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: temperature
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            echo "=== Starting Shama Copilot with Web Interface ==="
+            
+            # Create app directory
+            mkdir -p /app
+            cd /app
+            
+            # Install dependencies
+            pip install fastapi uvicorn requests kubernetes aiohttp
+            
+            # Create the application with proper HTML interface
+            cat > main.py << 'PYTHON'
+            import os
+            from fastapi import FastAPI, HTTPException
+            from fastapi.responses import HTMLResponse, JSONResponse
+            from pydantic import BaseModel
+            import aiohttp
+            import asyncio
+            from kubernetes import client, config
+
+            app = FastAPI(title="Shama Copilot")
+            
+            # Load K8s config
+            try:
+                config.load_incluster_config()
+                v1 = client.CoreV1Api()
+                print("✅ Kubernetes client ready")
+            except Exception as e:
+                print(f"❌ K8s client failed: {e}")
+                v1 = None
+
+            class AnalysisRequest(BaseModel):
+                query: str
+
+            async def query_azure_openai(prompt: str):
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '').rstrip('/')
+                api_key = os.getenv('AZURE_OPENAI_API_KEY', '')
+                deployment = os.getenv('DEPLOYMENT_NAME', 'gpt-4o-mini')
+                api_version = os.getenv('API_VERSION', '2023-12-01-preview')
+                
+                if not endpoint or not api_key:
+                    return {"error": "Azure OpenAI configuration missing"}
+                
+                url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+                
+                headers = {"Content-Type": "application/json", "api-key": api_key}
+                payload = {
+                    "messages": [
+                        {
+                            "role": "system", 
+                            "content": "You are Shama Copilot - an expert Kubernetes administrator for AKS. Provide clear, actionable recommendations about cluster health, performance, and optimization."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": int(os.getenv('MAX_TOKENS', 800)),
+                    "temperature": float(os.getenv('TEMPERATURE', 0.7))
+                }
+                
+                try:
+                    timeout = aiohttp.ClientTimeout(total=int(os.getenv('API_TIMEOUT', 30)))
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(url, headers=headers, json=payload) as response:
+                            if response.status == 200:
+                                return await response.json()
+                            else:
+                                error_text = await response.text()
+                                return {"error": f"API error {response.status}: {error_text}"}
+                except Exception as e:
+                    return {"error": f"API call failed: {str(e)}"}
+
+            def get_cluster_state():
+                if not v1:
+                    return {"error": "K8s client not available"}
+                try:
+                    nodes = v1.list_node()
+                    pods = v1.list_pod_for_all_namespaces()
+                    
+                    cluster_info = {
+                        "nodes": len(nodes.items),
+                        "pods": len(pods.items),
+                        "node_names": [n.metadata.name for n in nodes.items],
+                        "pod_phases": {},
+                        "namespaces": {}
+                    }
+                    
+                    for pod in pods.items:
+                        phase = pod.status.phase
+                        namespace = pod.metadata.namespace
+                        cluster_info["pod_phases"][phase] = cluster_info["pod_phases"].get(phase, 0) + 1
+                        cluster_info["namespaces"][namespace] = cluster_info["namespaces"].get(namespace, 0) + 1
+                    
+                    return cluster_info
+                except Exception as e:
+                    return {"error": str(e)}
+
+            @app.get("/", response_class=HTMLResponse)
+            async def read_root():
+                html_content = '''
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Shama AKS Copilot</title>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <style>
+                        body {
+                            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                            margin: 0;
+                            padding: 20px;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            min-height: 100vh;
+                        }
+                        .container {
+                            max-width: 900px;
+                            margin: 0 auto;
+                            background: white;
+                            padding: 30px;
+                            border-radius: 15px;
+                            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                        }
+                        h1 {
+                            color: #2c3e50;
+                            text-align: center;
+                            margin-bottom: 10px;
+                        }
+                        .subtitle {
+                            text-align: center;
+                            color: #7f8c8d;
+                            margin-bottom: 30px;
+                            font-size: 1.1em;
+                        }
+                        .query-box {
+                            width: 100%;
+                            height: 120px;
+                            padding: 15px;
+                            border: 2px solid #e0e0e0;
+                            border-radius: 10px;
+                            font-size: 16px;
+                            resize: vertical;
+                            transition: border-color 0.3s;
+                        }
+                        .query-box:focus {
+                            outline: none;
+                            border-color: #3498db;
+                        }
+                        .analyze-btn {
+                            background: linear-gradient(135deg, #3498db, #2980b9);
+                            color: white;
+                            padding: 15px 40px;
+                            border: none;
+                            border-radius: 10px;
+                            cursor: pointer;
+                            font-size: 16px;
+                            font-weight: bold;
+                            margin: 15px 0;
+                            transition: transform 0.2s, box-shadow 0.2s;
+                        }
+                        .analyze-btn:hover {
+                            transform: translateY(-2px);
+                            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
+                        }
+                        .analyze-btn:active {
+                            transform: translateY(0);
+                        }
+                        .cluster-info {
+                            background: #e8f4f8;
+                            padding: 20px;
+                            border-radius: 10px;
+                            margin: 20px 0;
+                            border-left: 5px solid #3498db;
+                        }
+                        .result {
+                            margin-top: 25px;
+                            padding: 25px;
+                            background: #f8f9fa;
+                            border-radius: 10px;
+                            border-left: 5px solid #27ae60;
+                            white-space: pre-wrap;
+                            line-height: 1.6;
+                        }
+                        .error {
+                            border-left-color: #e74c3c;
+                            background: #fdeded;
+                        }
+                        .loading {
+                            color: #7f8c8d;
+                            font-style: italic;
+                        }
+                        .suggestions {
+                            display: flex;
+                            flex-wrap: wrap;
+                            gap: 10px;
+                            margin: 15px 0;
+                        }
+                        .suggestion-btn {
+                            background: #ecf0f1;
+                            border: 1px solid #bdc3c7;
+                            padding: 8px 15px;
+                            border-radius: 20px;
+                            cursor: pointer;
+                            font-size: 14px;
+                            transition: all 0.2s;
+                        }
+                        .suggestion-btn:hover {
+                            background: #3498db;
+                            color: white;
+                            border-color: #3498db;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🚀 Shama AKS Copilot</h1>
+                        <div class="subtitle">AI-powered Kubernetes cluster management assistant</div>
+                        
+                        <div class="suggestions">
+                            <button class="suggestion-btn" onclick="setQuery(this)">How is my cluster health?</button>
+                            <button class="suggestion-btn" onclick="setQuery(this)">How many pods are running?</button>
+                            <button class="suggestion-btn" onclick="setQuery(this)">Any node issues?</button>
+                            <button class="suggestion-btn" onclick="setQuery(this)">Optimization suggestions</button>
+                        </div>
+                        
+                        <textarea class="query-box" id="query" placeholder="Ask me anything about your AKS cluster...&#10;Examples:&#10;- How is my cluster health?&#10;- How many pods are running?&#10;- Any issues with my nodes?&#10;- Suggest optimizations"></textarea>
+                        <br>
+                        <button class="analyze-btn" onclick="analyze()">Analyze Cluster</button>
+                        
+                        <div id="clusterState" class="cluster-info">
+                            <strong>📊 Cluster Status:</strong> Loading...
+                        </div>
+                        <div id="result" class="result"></div>
+                    </div>
+
+                    <script>
+                        function setQuery(btn) {
+                            document.getElementById('query').value = btn.textContent;
+                        }
+
+                        async function updateClusterState() {
+                            try {
+                                const response = await fetch('/cluster-state');
+                                const data = await response.json();
+                                document.getElementById('clusterState').innerHTML = 
+                                    `<strong>📊 Cluster Status:</strong> ${data.nodes} nodes, ${data.pods} pods running`;
+                            } catch (error) {
+                                document.getElementById('clusterState').innerHTML = 
+                                    '<strong>❌ Error loading cluster state</strong>';
+                            }
+                        }
+                        
+                        async function analyze() {
+                            const query = document.getElementById('query').value;
+                            const resultDiv = document.getElementById('result');
+                            resultDiv.innerHTML = '<div class="loading">🔍 Analyzing cluster state and generating recommendations...</div>';
+                            resultDiv.className = 'result';
+                            
+                            try {
+                                const response = await fetch('/analyze', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ query: query })
+                                });
+                                const data = await response.json();
+                                
+                                if (data.analysis && !data.analysis.includes('Error:')) {
+                                    resultDiv.innerHTML = `<h3>🤖 Analysis:</h3><div>${data.analysis.replace(/\\n/g, '<br>')}</div>`;
+                                } else {
+                                    resultDiv.innerHTML = `<h3>❌ Error:</h3><div>${data.analysis || 'Unknown error occurred'}</div>`;
+                                    resultDiv.className = 'result error';
+                                }
+                            } catch (error) {
+                                resultDiv.innerHTML = `<h3>❌ Connection Error:</h3><div>${error.message}</div>`;
+                                resultDiv.className = 'result error';
+                            }
+                        }
+                        
+                        // Load initial cluster state
+                        updateClusterState();
+                        
+                        // Allow Enter key to trigger analysis (with Shift+Enter for new line)
+                        document.getElementById('query').addEventListener('keydown', function(e) {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                analyze();
+                            }
+                        });
+                    </script>
+                </body>
+                </html>
+                '''
+                return HTMLResponse(content=html_content)
+
+            @app.post("/analyze")
+            async def analyze_cluster(request: AnalysisRequest):
+                print(f"Analyzing: {request.query}")
+                cluster_state = get_cluster_state()
+                
+                if "error" in cluster_state:
+                    return {"analysis": f"Error getting cluster state: {cluster_state['error']}"}
+                
+                prompt = f"""
+                User Query: {request.query}
+                
+                Current AKS Cluster State:
+                - Total Nodes: {cluster_state['nodes']}
+                - Node Names: {', '.join(cluster_state['node_names'])}
+                - Total Pods: {cluster_state['pods']}
+                - Pod Status Distribution: {cluster_state['pod_phases']}
+                - Pods by Namespace: {cluster_state['namespaces']}
+                
+                Please analyze this cluster state and provide specific, actionable recommendations.
+                Focus on: cluster health, resource utilization, potential issues, and optimization suggestions.
+                """
+                
+                result = await query_azure_openai(prompt)
+                
+                if "error" in result:
+                    return {"analysis": f"Azure OpenAI Error: {result['error']}"}
+                
+                return {
+                    "analysis": result.get('choices', [{}])[0].get('message', {}).get('content', 'No response from AI'),
+                    "cluster_state": cluster_state
+                }
+
+            @app.get("/cluster-state")
+            async def cluster_state():
+                state = get_cluster_state()
+                return {
+                    "nodes": state.get("nodes", 0),
+                    "pods": state.get("pods", 0)
+                }
+
+            @app.get("/health")
+            async def health():
+                return {"status": "healthy", "service": "shama-copilot"}
+
+            @app.get("/config")
+            async def get_config():
+                return {
+                    "deployment_name": os.getenv('DEPLOYMENT_NAME'),
+                    "api_version": os.getenv('API_VERSION'),
+                    "timeout": os.getenv('API_TIMEOUT'),
+                    "max_tokens": os.getenv('MAX_TOKENS')
+                }
+
+            if __name__ == "__main__":
+                import uvicorn
+                print("🚀 Starting Shama Copilot with Web Interface...")
+                uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+            PYTHON
+
+            echo "Starting application with web interface..."
+            python main.py

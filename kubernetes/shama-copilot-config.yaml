@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shama-copilot-config
+  namespace: shama-copilot
+data:
+  deployment-name: "gpt-4o-mini"
+  api-version: "2024-02-15"
+  api-timeout: "30"
+  max-tokens: "800"
+  temperature: "0.7"

@@ -1,0 +1,204 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shama-copilot-service
+  namespace: shama-copilot
+spec:
+  ports:
+  - port: 80
+    targetPort: 8000
+  selector:
+    app: shama-copilot
+  type: LoadBalancer
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shama-copilot-deployment
+  namespace: shama-copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shama-copilot
+  template:
+    metadata:
+      labels:
+        app: shama-copilot
+    spec:
+      containers:
+      - name: copilot
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8000
+        env:
+        # Sensitive data from Secret
+        - name: AZURE_OPENAI_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: endpoint
+        - name: AZURE_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: api-key
+        # Configuration from ConfigMap
+        - name: DEPLOYMENT_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: deployment-name
+        - name: API_VERSION
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: api-version
+        - name: API_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: api-timeout
+        - name: MAX_TOKENS
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: max-tokens
+        - name: TEMPERATURE
+          valueFrom:
+            configMapKeyRef:
+              name: shama-copilot-config
+              key: temperature
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+            echo "=== Starting Shama Copilot ==="
+            
+            # Create app directory
+            mkdir -p /app
+            cd /app
+            
+            # Install dependencies
+            pip install fastapi uvicorn requests kubernetes aiohttp
+            
+            # Create the application that reads from environment variables
+            cat > main.py << 'PYTHON'
+            import os
+            print("=== Configuration Check ===")
+            print(f"Deployment: {os.getenv('DEPLOYMENT_NAME', 'NOT_SET')}")
+            print(f"API Version: {os.getenv('API_VERSION', 'NOT_SET')}")
+            print(f"Timeout: {os.getenv('API_TIMEOUT', 'NOT_SET')}s")
+            print(f"Max Tokens: {os.getenv('MAX_TOKENS', 'NOT_SET')}")
+            print(f"Temperature: {os.getenv('TEMPERATURE', 'NOT_SET')}")
+            
+            from fastapi import FastAPI
+            from fastapi.responses import HTMLResponse
+            from pydantic import BaseModel
+            import aiohttp
+            import asyncio
+            from kubernetes import client, config
+
+            app = FastAPI(title="Shama Copilot")
+            
+            # Load K8s config
+            try:
+                config.load_incluster_config()
+                v1 = client.CoreV1Api()
+                print("✅ Kubernetes client ready")
+            except Exception as e:
+                print(f"❌ K8s client failed: {e}")
+                v1 = None
+
+            class AnalysisRequest(BaseModel):
+                query: str
+
+            async def query_azure_openai(prompt: str):
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '').rstrip('/')
+                api_key = os.getenv('AZURE_OPENAI_API_KEY', '')
+                deployment = os.getenv('DEPLOYMENT_NAME', 'gpt-4o-mini')
+                api_version = os.getenv('API_VERSION', '2024-02-15')
+                
+                if not endpoint or not api_key:
+                    return {"error": "Azure OpenAI configuration missing"}
+                
+                url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+                
+                headers = {"Content-Type": "application/json", "api-key": api_key}
+                payload = {
+                    "messages": [
+                        {"role": "system", "content": "You are a Kubernetes expert."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": int(os.getenv('MAX_TOKENS', 800)),
+                    "temperature": float(os.getenv('TEMPERATURE', 0.7))
+                }
+                
+                try:
+                    timeout = aiohttp.ClientTimeout(total=int(os.getenv('API_TIMEOUT', 30)))
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(url, headers=headers, json=payload) as response:
+                            if response.status == 200:
+                                return await response.json()
+                            else:
+                                error_text = await response.text()
+                                return {"error": f"API error {response.status}: {error_text}"}
+                except Exception as e:
+                    return {"error": f"API call failed: {str(e)}"}
+
+            def get_cluster_state():
+                if not v1:
+                    return {"error": "K8s client not available"}
+                try:
+                    nodes = v1.list_node()
+                    pods = v1.list_pod_for_all_namespaces()
+                    return {
+                        "nodes": len(nodes.items),
+                        "pods": len(pods.items),
+                        "node_names": [n.metadata.name for n in nodes.items]
+                    }
+                except Exception as e:
+                    return {"error": str(e)}
+
+            @app.post("/analyze")
+            async def analyze_cluster(request: AnalysisRequest):
+                cluster_state = get_cluster_state()
+                
+                if "error" in cluster_state:
+                    return {"analysis": f"Error: {cluster_state['error']}"}
+                
+                prompt = f"Cluster: {cluster_state['nodes']} nodes, {cluster_state['pods']} pods. Query: {request.query}"
+                result = await query_azure_openai(prompt)
+                
+                if "error" in result:
+                    return {"analysis": f"OpenAI Error: {result['error']}"}
+                
+                return {
+                    "analysis": result.get('choices', [{}])[0].get('message', {}).get('content', 'No response'),
+                    "cluster_state": cluster_state
+                }
+
+            @app.get("/")
+            async def read_root():
+                return {"status": "ready", "config": {
+                    "deployment": os.getenv('DEPLOYMENT_NAME'),
+                    "api_version": os.getenv('API_VERSION')
+                }}
+
+            @app.get("/config")
+            async def get_config():
+                return {
+                    "deployment_name": os.getenv('DEPLOYMENT_NAME'),
+                    "api_version": os.getenv('API_VERSION'),
+                    "timeout": os.getenv('API_TIMEOUT'),
+                    "max_tokens": os.getenv('MAX_TOKENS')
+                }
+
+            if __name__ == "__main__":
+                import uvicorn
+                uvicorn.run(app, host="0.0.0.0", port=8000)
+            PYTHON
+
+            echo "Starting application..."
+            python main.py

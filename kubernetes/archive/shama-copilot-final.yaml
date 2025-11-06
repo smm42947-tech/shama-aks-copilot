@@ -1,0 +1,285 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shama-copilot-service
+  namespace: shama-copilot
+spec:
+  ports:
+  - port: 80
+    targetPort: 8000
+  selector:
+    app: shama-copilot
+  type: LoadBalancer
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shama-copilot-deployment
+  namespace: shama-copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shama-copilot
+  template:
+    metadata:
+      labels:
+        app: shama-copilot
+    spec:
+      containers:
+      - name: copilot
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8000
+        env:
+        - name: AZURE_OPENAI_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: endpoint
+        - name: AZURE_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shama-openai-secret
+              key: api-key
+        - name: DEPLOYMENT_NAME
+          value: "gpt-4o-mini"
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Install dependencies
+            pip install fastapi uvicorn requests kubernetes aiohttp
+            
+            # Create the application
+            cat > /app/main.py << 'PYTHON'
+            from fastapi import FastAPI, HTTPException
+            from fastapi.responses import HTMLResponse
+            from pydantic import BaseModel
+            import requests
+            import os
+            import json
+            from kubernetes import client, config
+            import aiohttp
+            import asyncio
+
+            app = FastAPI(title="Shama Copilot")
+            
+            # Load Kubernetes config
+            try:
+                config.load_incluster_config()
+                v1 = client.CoreV1Api()
+                print("✓ Kubernetes client initialized")
+            except Exception as e:
+                print(f"✗ Kubernetes client failed: {e}")
+                v1 = None
+
+            class AnalysisRequest(BaseModel):
+                query: str
+
+            async def query_azure_openai(prompt: str):
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT', '').rstrip('/')
+                api_key = os.getenv('AZURE_OPENAI_API_KEY', '')
+                deployment = os.getenv('DEPLOYMENT_NAME', 'gpt-4o-mini')
+                
+                print(f"OpenAI Config - Endpoint: {endpoint}, Deployment: {deployment}")
+                
+                if not endpoint or not api_key:
+                    error_msg = "Azure OpenAI configuration missing"
+                    print(f"✗ {error_msg}")
+                    return {"error": error_msg}
+                
+                url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15"
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "api-key": api_key
+                }
+                
+                payload = {
+                    "messages": [
+                        {
+                            "role": "system", 
+                            "content": "You are Shama Copilot - an expert Kubernetes administrator for AKS. Provide clear, actionable recommendations. Be concise and helpful."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 800,
+                    "temperature": 0.7
+                }
+                
+                try:
+                    print(f"Calling Azure OpenAI: {url}")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, headers=headers, json=payload, timeout=30) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                print("✓ OpenAI API call successful")
+                                return result
+                            else:
+                                error_text = await response.text()
+                                print(f"✗ OpenAI API error: {response.status} - {error_text}")
+                                return {"error": f"API returned {response.status}: {error_text}"}
+                except Exception as e:
+                    error_msg = f"OpenAI API call failed: {str(e)}"
+                    print(f"✗ {error_msg}")
+                    return {"error": error_msg}
+
+            def get_cluster_state():
+                if not v1:
+                    return {"error": "Kubernetes client not available"}
+                    
+                try:
+                    nodes = v1.list_node()
+                    pods = v1.list_pod_for_all_namespaces()
+                    
+                    cluster_info = {
+                        "nodes": len(nodes.items),
+                        "pods": len(pods.items),
+                        "node_names": [node.metadata.name for node in nodes.items],
+                        "pod_phases": {},
+                        "namespaces": {}
+                    }
+                    
+                    for pod in pods.items:
+                        phase = pod.status.phase
+                        namespace = pod.metadata.namespace
+                        cluster_info["pod_phases"][phase] = cluster_info["pod_phases"].get(phase, 0) + 1
+                        cluster_info["namespaces"][namespace] = cluster_info["namespaces"].get(namespace, 0) + 1
+                    
+                    print(f"✓ Cluster state collected: {cluster_info['nodes']} nodes, {cluster_info['pods']} pods")
+                    return cluster_info
+                except Exception as e:
+                    error_msg = f"Failed to get cluster state: {str(e)}"
+                    print(f"✗ {error_msg}")
+                    return {"error": error_msg}
+
+            @app.post("/analyze")
+            async def analyze_cluster(request: AnalysisRequest):
+                print(f"Received analysis request: {request.query}")
+                try:
+                    cluster_state = get_cluster_state()
+                    
+                    if "error" in cluster_state:
+                        return {"analysis": f"Cluster state error: {cluster_state['error']}"}
+                    
+                    prompt = f"""
+                    User Query: {request.query}
+                    
+                    Current AKS Cluster State:
+                    - Total Nodes: {cluster_state['nodes']}
+                    - Node Names: {', '.join(cluster_state['node_names'])}
+                    - Total Pods: {cluster_state['pods']}
+                    - Pod Status Distribution: {cluster_state['pod_phases']}
+                    - Pods by Namespace: {cluster_state['namespaces']}
+                    
+                    Please analyze this cluster state and provide specific, actionable recommendations.
+                    """
+                    
+                    result = await query_azure_openai(prompt)
+                    
+                    if "error" in result:
+                        return {"analysis": f"Azure OpenAI error: {result['error']}"}
+                    
+                    return {
+                        "analysis": result.get('choices', [{}])[0].get('message', {}).get('content', 'No response from AI'),
+                        "cluster_state": cluster_state
+                    }
+                except Exception as e:
+                    return {"analysis": f"Analysis failed: {str(e)}"}
+
+            @app.get("/", response_class=HTMLResponse)
+            async def read_root():
+                return '''
+                <html>
+                    <head>
+                        <title>Shama AKS Copilot</title>
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                            h1 { color: #0078d4; }
+                            textarea { width: 100%; height: 100px; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
+                            button { background: #0078d4; color: white; padding: 12px 30px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 10px 0; }
+                            button:hover { background: #106ebe; }
+                            .result { margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #0078d4; }
+                            .cluster-info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>🚀 Shama AKS Copilot</h1>
+                            <p>Ask questions about your AKS cluster health, performance, and optimization</p>
+                            
+                            <textarea id="query" placeholder="e.g., How is my cluster health? Any pod issues? Optimization suggestions?"></textarea>
+                            <br>
+                            <button onclick="analyze()">Analyze Cluster</button>
+                            
+                            <div id="clusterState" class="cluster-info">Loading cluster state...</div>
+                            <div id="result" class="result"></div>
+                        </div>
+                        
+                        <script>
+                            async function updateClusterState() {
+                                try {
+                                    const response = await fetch('/cluster-state');
+                                    const data = await response.json();
+                                    document.getElementById('clusterState').innerHTML = 
+                                        `<strong>📊 Cluster Status:</strong> ${data.nodes} nodes, ${data.pods} pods running`;
+                                } catch (error) {
+                                    document.getElementById('clusterState').innerHTML = 
+                                        '<strong>❌ Error loading cluster state</strong>';
+                                }
+                            }
+                            
+                            async function analyze() {
+                                const query = document.getElementById('query').value;
+                                const resultDiv = document.getElementById('result');
+                                resultDiv.innerHTML = '<em>🔍 Analyzing cluster... Please wait.</em>';
+                                
+                                try {
+                                    const response = await fetch('/analyze', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ query: query })
+                                    });
+                                    const data = await response.json();
+                                    resultDiv.innerHTML = `<h3>🤖 Analysis:</h3><p>${data.analysis.replace(/\\n/g, '<br>')}</p>`;
+                                } catch (error) {
+                                    resultDiv.innerHTML = `<h3>❌ Error:</h3><p>${error.message}</p>`;
+                                }
+                            }
+                            
+                            updateClusterState();
+                        </script>
+                    </body>
+                </html>
+                '''
+
+            @app.get("/cluster-state")
+            async def cluster_state():
+                state = get_cluster_state()
+                return {
+                    "nodes": state.get("nodes", 0),
+                    "pods": state.get("pods", 0)
+                }
+
+            @app.get("/health")
+            async def health():
+                return {"status": "healthy", "service": "shama-copilot"}
+
+            if __name__ == "__main__":
+                print("Starting Shama Copilot server...")
+                import uvicorn
+                uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+            PYTHON
+
+            # Start the application
+            echo "Starting Shama Copilot application..."
+            cd /app && python main.py
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

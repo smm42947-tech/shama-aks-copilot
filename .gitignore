@@ -1,0 +1,21 @@
+# Kubernetes
+**/*.bak
+**/*.tmp
+
+# Local
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+temp/
+tmp/
